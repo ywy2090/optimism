@@ -30,19 +30,34 @@ import { ISuperchainConfig } from "interfaces/L1/ISuperchainConfig.sol";
 
 /// @custom:proxied true
 /// @title OptimismPortal2
-/// @notice The OptimismPortal is a low-level contract responsible for passing messages between L1
-///         and L2. Messages sent directly to the OptimismPortal have no form of replayability.
-///         Users are encouraged to use the L1CrossDomainMessenger for a higher-level interface.
+/// @notice OptimismPortal2 是 Optimism Bedrock 的核心合约，负责处理 L1 和 L2 之间的消息传递。
+///         这是 L1 上的入口合约，处理两个主要功能：
+///         1. 存款（Deposit）：从 L1 向 L2 发送交易和 ETH
+///         2. 提款（Withdrawal）：从 L2 向 L1 提款，需要经过证明和最终确认两个阶段
+///         
+///         安全机制：
+///         - 提款需要基于有效的 DisputeGame 进行证明
+///         - 证明后需要等待成熟期（PROOF_MATURITY_DELAY_SECONDS）才能最终确认
+///         - 使用重入保护（l2Sender）防止重入攻击
+///         
+///         注意：直接调用 OptimismPortal 的消息没有重放保护，建议使用 L1CrossDomainMessenger 作为高级接口。
 contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase, ProxyAdminOwnedBase, ISemver {
-    /// @notice Represents a proven withdrawal.
-    /// @custom:field disputeGameProxy Game that the withdrawal was proven against.
-    /// @custom:field timestamp        Timestamp at which the withdrawal was proven.
+    /// @notice 表示一个已证明的提款
+    /// @custom:field disputeGameProxy 提款所基于的争议游戏代理合约地址
+    /// @custom:field timestamp          提款被证明时的时间戳
+    /// 
+    /// 这个结构体用于记录提款的证明信息。每个提款哈希可以对应多个证明者，
+    /// 这样可以防止恶意用户通过提交无效证明来阻止其他用户的提款。
     struct ProvenWithdrawal {
-        IDisputeGame disputeGameProxy;
-        uint64 timestamp;
+        IDisputeGame disputeGameProxy;  // 争议游戏合约，用于验证状态根的有效性
+        uint64 timestamp;               // 证明时间戳，用于计算成熟期
     }
 
-    /// @notice The delay between when a withdrawal is proven and when it may be finalized.
+    /// @notice 提款证明成熟期延迟（秒）
+    /// 
+    /// 这是一个安全机制：提款在被证明后，必须等待这个时间才能最终确认。
+    /// 这样可以给挑战者足够的时间来质疑无效的证明，防止恶意提款。
+    /// 通常设置为 7 天（604800 秒）。
     uint256 internal immutable PROOF_MATURITY_DELAY_SECONDS;
 
     /// @notice Version of the deposit event.
@@ -329,11 +344,20 @@ contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase
         // Intentionally empty.
     }
 
-    /// @notice Proves a withdrawal transaction using an Output Root proof.
-    /// @param _tx               Withdrawal transaction to finalize.
-    /// @param _disputeGameIndex Index of the dispute game to prove the withdrawal against.
-    /// @param _outputRootProof  Inclusion proof of the L2ToL1MessagePasser storage root.
-    /// @param _withdrawalProof  Inclusion proof of the withdrawal within the L2ToL1MessagePasser.
+    /// @notice 使用输出根证明来证明一个提款交易
+    /// 
+    /// 这是提款流程的第二阶段（第一阶段在 L2 发起，第三阶段是最终确认）。
+    /// 
+    /// 证明过程：
+    /// 1. 验证 DisputeGame 的有效性（必须是 Proper Game，必须是 Respected Game Type）
+    /// 2. 验证输出根证明（确保状态根有效）
+    /// 3. 验证 Merkle 包含证明（确保提款确实在 L2 上发生）
+    /// 4. 记录证明信息，等待成熟期后可以最终确认
+    /// 
+    /// @param _tx               要证明的提款交易
+    /// @param _disputeGameIndex 用于证明的争议游戏索引
+    /// @param _outputRootProof  输出根证明，包含 L2ToL1MessagePasser 的存储根
+    /// @param _withdrawalProof  Merkle 包含证明，证明提款在 L2ToL1MessagePasser 中
     function proveWithdrawalTransaction(
         Types.WithdrawalTransaction memory _tx,
         uint256 _disputeGameIndex,
@@ -342,85 +366,89 @@ contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase
     )
         external
     {
-        // Cannot prove withdrawal transactions while the system is paused.
+        // 系统暂停时不能证明提款
         _assertNotPaused();
 
-        // Make sure that the target address is safe.
+        // 确保目标地址是安全的（不能是 Portal 自身或 ETHLockbox）
         if (_isUnsafeTarget(_tx.target)) {
             revert OptimismPortal_BadTarget();
         }
 
-        // Cannot prove withdrawal with value when custom gas token mode is enabled.
+        // 如果启用了自定义 Gas Token 模式，不能提款 ETH
         if (_isUsingCustomGasToken()) {
             if (_tx.value > 0) revert OptimismPortal_NotAllowedOnCGTMode();
         }
 
-        // Fetch the dispute game proxy from the `DisputeGameFactory` contract.
+        // 从 DisputeGameFactory 获取争议游戏代理合约
         (,, IDisputeGame disputeGameProxy) = disputeGameFactory().gameAtIndex(_disputeGameIndex);
 
-        // Game must be a Proper Game.
+        // 验证：游戏必须是 Proper Game（有效的游戏）
+        // Proper Game 意味着游戏类型已注册且配置正确
         if (!anchorStateRegistry.isGameProper(disputeGameProxy)) {
             revert OptimismPortal_ImproperDisputeGame();
         }
 
-        // Game must have been respected game type when created.
+        // 验证：游戏创建时必须是 Respected Game Type（受尊重的游戏类型）
+        // Respected Game Type 是当前系统认可的游戏类型，用于验证状态根
         if (!anchorStateRegistry.isGameRespected(disputeGameProxy)) {
             revert OptimismPortal_InvalidDisputeGame();
         }
 
-        // Game must not have resolved in favor of the Challenger (invalid root claim).
+        // 验证：游戏不能已判定挑战者获胜（即状态根无效）
+        // 如果挑战者获胜，说明状态根是无效的，不能基于此证明提款
         if (disputeGameProxy.status() == GameStatus.CHALLENGER_WINS) {
             revert OptimismPortal_InvalidDisputeGame();
         }
 
-        // As a sanity check, we make sure that the current timestamp is not less than or equal to
-        // the dispute game's creation timestamp. Not strictly necessary but extra layer of
-        // safety against weird bugs. Note that this blocks withdrawals from being proven in the
-        // same block that a dispute game is created.
+        // 安全检查：确保当前时间戳大于争议游戏的创建时间戳
+        // 这防止了在游戏创建的同一区块中证明提款，增加了安全性
         if (block.timestamp <= disputeGameProxy.createdAt().raw()) {
             revert OptimismPortal_InvalidProofTimestamp();
         }
 
-        // Verify that the output root can be generated with the elements in the proof.
+        // 验证：输出根必须与证明中的元素匹配
+        // 争议游戏的根声明（rootClaim）应该等于输出根证明的哈希
         if (disputeGameProxy.rootClaim().raw() != Hashing.hashOutputRootProof(_outputRootProof)) {
             revert OptimismPortal_InvalidOutputRootProof();
         }
 
-        // Load the ProvenWithdrawal into memory, using the withdrawal hash as a unique identifier.
+        // 计算提款交易的哈希，作为唯一标识符
         bytes32 withdrawalHash = Hashing.hashWithdrawal(_tx);
 
-        // Compute the storage slot of the withdrawal hash in the L2ToL1MessagePasser contract.
-        // Refer to the Solidity documentation for more information on how storage layouts are
-        // computed for mappings.
+        // 计算提款哈希在 L2ToL1MessagePasser 合约中的存储槽
+        // 这是 Solidity mapping 的存储布局计算方式
+        // sentMessages[withdrawalHash] 的存储槽 = keccak256(abi.encode(withdrawalHash, slot(0)))
         bytes32 storageKey = keccak256(
             abi.encode(
                 withdrawalHash,
-                uint256(0) // The withdrawals mapping is at the first slot in the layout.
+                uint256(0) // sentMessages mapping 在布局的第一个槽位
             )
         );
 
-        // Verify that the hash of this withdrawal was stored in the L2toL1MessagePasser contract
-        // on L2. If this is true, under the assumption that the SecureMerkleTrie does not have
-        // bugs, then we know that this withdrawal was actually triggered on L2 and can therefore
-        // be relayed on L1.
+        // 验证：使用 Merkle 包含证明验证提款确实在 L2 上发生
+        // 如果验证通过，说明：
+        // 1. 提款确实在 L2ToL1MessagePasser 合约中被记录（sentMessages[withdrawalHash] = true）
+        // 2. 该记录包含在输出根证明的存储根中
+        // 3. 因此可以在 L1 上中继执行
         if (
             SecureMerkleTrie.verifyInclusionProof({
-                _key: abi.encode(storageKey),
-                _value: hex"01",
-                _proof: _withdrawalProof,
-                _root: _outputRootProof.messagePasserStorageRoot
+                _key: abi.encode(storageKey),                    // 存储键
+                _value: hex"01",                                // 存储值（true 的编码）
+                _proof: _withdrawalProof,                       // Merkle 证明路径
+                _root: _outputRootProof.messagePasserStorageRoot // L2ToL1MessagePasser 的存储根
             }) == false
         ) {
             revert OptimismPortal_InvalidMerkleProof();
         }
 
-        // Designate the withdrawalHash as proven by storing the disputeGameProxy and timestamp in
-        // the provenWithdrawals mapping. A given user may re-prove a withdrawalHash multiple
-        // times, but each proof will reset the proof timer.
+        // 将提款标记为已证明，记录争议游戏代理和时间戳
+        // 注意：同一个提款哈希可以被多个用户多次证明，每次证明都会重置计时器
+        // 这防止了恶意用户通过提交无效证明来阻止其他用户的提款
         provenWithdrawals[withdrawalHash][msg.sender] =
             ProvenWithdrawal({ disputeGameProxy: disputeGameProxy, timestamp: uint64(block.timestamp) });
 
-        // Add the proof submitter to the list of proof submitters for this withdrawal hash.
+        // 将证明提交者添加到该提款哈希的证明提交者列表中
+        // 链下工具可以使用这个列表来确定应该使用哪个证明来最终确认提款
         proofSubmitters[withdrawalHash].push(msg.sender);
 
         // Emit a WithdrawalProven events.
@@ -428,68 +456,82 @@ contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase
         emit WithdrawalProvenExtension1(withdrawalHash, msg.sender);
     }
 
-    /// @notice Finalizes a withdrawal transaction.
-    /// @param _tx Withdrawal transaction to finalize.
+    /// @notice 最终确认一个提款交易
+    /// 
+    /// 这是提款流程的第三阶段（最后阶段）。在证明成熟期过后，可以调用此函数来最终确认提款。
+    /// 
+    /// 流程：
+    /// 1. 检查提款是否已证明且成熟期已过
+    /// 2. 检查争议游戏是否仍然有效
+    /// 3. 标记提款为已最终确认（防止重放）
+    /// 4. 如果使用 ETHLockbox，解锁 ETH
+    /// 5. 执行提款交易（调用目标合约）
+    /// 
+    /// @param _tx 要最终确认的提款交易
     function finalizeWithdrawalTransaction(Types.WithdrawalTransaction memory _tx) external {
         finalizeWithdrawalTransactionExternalProof(_tx, msg.sender);
     }
 
-    /// @notice Finalizes a withdrawal transaction, using an external proof submitter.
-    /// @param _tx Withdrawal transaction to finalize.
-    /// @param _proofSubmitter Address of the proof submitter.
+    /// @notice 最终确认提款交易，使用外部证明提交者
+    /// 
+    /// 这个函数允许指定使用哪个证明提交者的证明来最终确认提款。
+    /// 这在有多个证明提交者时很有用。
+    /// 
+    /// @param _tx            要最终确认的提款交易
+    /// @param _proofSubmitter 证明提交者的地址
     function finalizeWithdrawalTransactionExternalProof(
         Types.WithdrawalTransaction memory _tx,
         address _proofSubmitter
     )
         public
     {
-        // Cannot finalize withdrawal transactions while the system is paused.
+        // 系统暂停时不能最终确认提款
         _assertNotPaused();
 
-        // Cannot finalize withdrawal with value when custom gas token mode is enabled.
+        // 如果启用了自定义 Gas Token 模式，不能提款 ETH
         if (_isUsingCustomGasToken()) {
             if (_tx.value > 0) revert OptimismPortal_NotAllowedOnCGTMode();
         }
 
-        // Make sure that the l2Sender has not yet been set. The l2Sender is set to a value other
-        // than the default value when a withdrawal transaction is being finalized. This check is
-        // a defacto reentrancy guard.
+        // 重入保护：确保 l2Sender 还未被设置
+        // l2Sender 在最终确认提款时会被设置为非默认值，这个检查是事实上的重入保护
+        // 如果 l2Sender 不是默认值，说明我们正在处理另一个提款，应该拒绝
         if (l2Sender != Constants.DEFAULT_L2_SENDER) {
             revert OptimismPortal_NoReentrancy();
         }
 
-        // Make sure that the target address is safe.
+        // 确保目标地址是安全的
         if (_isUnsafeTarget(_tx.target)) {
             revert OptimismPortal_BadTarget();
         }
 
-        // Grab the withdrawal.
+        // 计算提款哈希
         bytes32 withdrawalHash = Hashing.hashWithdrawal(_tx);
 
-        // Check that the withdrawal can be finalized.
+        // 检查提款是否可以最终确认（验证证明、成熟期、争议游戏有效性等）
         checkWithdrawal(withdrawalHash, _proofSubmitter);
 
-        // Mark the withdrawal as finalized so it can't be replayed.
+        // 标记提款为已最终确认，防止重放攻击
         finalizedWithdrawals[withdrawalHash] = true;
 
-        // If using ETHLockbox, unlock the ETH from the ETHLockbox.
+        // 如果使用 ETHLockbox，从 ETHLockbox 解锁 ETH
+        // ETHLockbox 是一个特殊的合约，用于在启用时管理 ETH 的锁定和解锁
         if (_isUsingLockbox()) {
             if (_tx.value > 0) ethLockbox.unlockETH(_tx.value);
         }
 
-        // Set the l2Sender so contracts know who triggered this withdrawal on L2.
+        // 设置 l2Sender，这样被调用的合约可以知道是谁在 L2 上触发了这个提款
+        // 这对于跨链消息传递很重要
         l2Sender = _tx.sender;
 
-        // Trigger the call to the target contract. We use a custom low level method
-        // SafeCall.callWithMinGas to ensure two key properties
-        //   1. Target contracts cannot force this call to run out of gas by returning a very large
-        //      amount of data (and this is OK because we don't care about the returndata here).
-        //   2. The amount of gas provided to the execution context of the target is at least the
-        //      gas limit specified by the user. If there is not enough gas in the current context
-        //      to accomplish this, `callWithMinGas` will revert.
+        // 执行对目标合约的调用
+        // 使用 SafeCall.callWithMinGas 确保两个关键属性：
+        // 1. 目标合约不能通过返回大量数据来强制调用耗尽 gas（我们不关心返回值）
+        // 2. 提供给目标合约执行上下文的 gas 至少是用户指定的 gas 限制
+        //    如果当前上下文中没有足够的 gas，callWithMinGas 会回滚
         bool success = SafeCall.callWithMinGas(_tx.target, _tx.gasLimit, _tx.value, _tx.data);
 
-        // Reset the l2Sender back to the default value.
+        // 将 l2Sender 重置为默认值
         l2Sender = Constants.DEFAULT_L2_SENDER;
 
         // All withdrawals are immediately finalized. Replayability can
@@ -512,56 +554,75 @@ contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase
         }
     }
 
-    /// @notice Checks that a withdrawal has been proven and is ready to be finalized.
-    /// @param _withdrawalHash Hash of the withdrawal.
-    /// @param _proofSubmitter Address of the proof submitter.
+    /// @notice 检查提款是否已证明且可以最终确认
+    /// 
+    /// 这个函数执行所有必要的检查，确保提款可以安全地最终确认：
+    /// 1. 提款未被最终确认过（重放保护）
+    /// 2. 提款已被证明（时间戳非零）
+    /// 3. 证明时间戳有效（大于争议游戏创建时间）
+    /// 4. 证明成熟期已过（等待时间足够）
+    /// 5. 争议游戏的根声明仍然有效
+    /// 
+    /// @param _withdrawalHash 提款哈希
+    /// @param _proofSubmitter 证明提交者地址
     function checkWithdrawal(bytes32 _withdrawalHash, address _proofSubmitter) public view {
-        // Grab the withdrawal and dispute game proxy.
+        // 获取提款证明信息和争议游戏代理
         ProvenWithdrawal memory provenWithdrawal = provenWithdrawals[_withdrawalHash][_proofSubmitter];
         IDisputeGame disputeGameProxy = provenWithdrawal.disputeGameProxy;
 
-        // Check that this withdrawal has not already been finalized, this is replay protection.
+        // 检查：提款未被最终确认过（重放保护）
         if (finalizedWithdrawals[_withdrawalHash]) {
             revert OptimismPortal_AlreadyFinalized();
         }
 
-        // A withdrawal can only be finalized if it has been proven. We know that a withdrawal has
-        // been proven at least once when its timestamp is non-zero. Unproven withdrawals will have
-        // a timestamp of zero.
+        // 检查：提款必须已被证明
+        // 如果时间戳为零，说明提款未被证明
         if (provenWithdrawal.timestamp == 0) {
             revert OptimismPortal_Unproven();
         }
 
-        // As a sanity check, we make sure that the proven withdrawal's timestamp is greater than
-        // starting timestamp inside the Dispute Game. Not strictly necessary but extra layer of
-        // safety against weird bugs in the proving step. Note that this blocks withdrawals that
-        // are proven in the same block that a dispute game is created.
+        // 安全检查：证明时间戳必须大于争议游戏的创建时间戳
+        // 这防止了在游戏创建的同一区块中证明提款
         if (provenWithdrawal.timestamp <= disputeGameProxy.createdAt().raw()) {
             revert OptimismPortal_InvalidProofTimestamp();
         }
 
-        // A proven withdrawal must wait at least `PROOF_MATURITY_DELAY_SECONDS` before finalizing.
+        // 检查：证明成熟期必须已过
+        // 已证明的提款必须等待至少 PROOF_MATURITY_DELAY_SECONDS 秒才能最终确认
+        // 这给挑战者足够的时间来质疑无效的证明
         if (block.timestamp - provenWithdrawal.timestamp <= PROOF_MATURITY_DELAY_SECONDS) {
             revert OptimismPortal_ProofNotOldEnough();
         }
 
-        // Check that the root claim is valid.
+        // 检查：争议游戏的根声明必须仍然有效
+        // 如果游戏被标记为无效或已退休，不能基于此最终确认提款
         if (!anchorStateRegistry.isGameClaimValid(disputeGameProxy)) {
             revert OptimismPortal_InvalidRootClaim();
         }
     }
 
-    /// @notice Accepts deposits of ETH and data, and emits a TransactionDeposited event for use in
-    ///         deriving deposit transactions. Note that if a deposit is made by a contract, its
-    ///         address will be aliased when retrieved using `tx.origin` or `msg.sender`. Consider
-    ///         using the CrossDomainMessenger contracts for a simpler developer experience.
-    /// @dev    The `msg.value` is locked on the ETHLockbox and minted as ETH when the deposit
-    ///         arrives on L2, while `_value` specifies how much ETH to send to the target.
-    /// @param _to         Target address on L2.
-    /// @param _value      ETH value to send to the recipient.
-    /// @param _gasLimit   Amount of L2 gas to purchase by burning gas on L1.
-    /// @param _isCreation Whether or not the transaction is a contract creation.
-    /// @param _data       Data to trigger the recipient with.
+    /// @notice 接受 ETH 和数据存款，发出 TransactionDeposited 事件用于在 L2 上派生存款交易
+    /// 
+    /// 这是存款流程的核心函数。当用户想要从 L1 向 L2 发送交易时，调用此函数。
+    /// 
+    /// 工作流程：
+    /// 1. 如果使用 ETHLockbox，锁定 ETH
+    /// 2. 验证参数（gas 限制、calldata 大小等）
+    /// 3. 处理地址别名（如果是合约调用）
+    /// 4. 发出 TransactionDeposited 事件
+    /// 5. Rollup 节点监听事件，在 L2 上构建并执行存款交易
+    /// 
+    /// 重要说明：
+    /// - 如果存款由合约发起，地址会被别名化（使用 AddressAliasHelper）
+    /// - 建议使用 CrossDomainMessenger 作为更高级的接口
+    /// - msg.value 会被锁定在 ETHLockbox（如果启用），在 L2 上铸造为 ETH
+    /// - _value 指定发送给接收者的 ETH 数量
+    /// 
+    /// @param _to          L2 上的目标地址
+    /// @param _value       发送给接收者的 ETH 数量
+    /// @param _gasLimit    通过燃烧 L1 gas 购买的 L2 gas 数量
+    /// @param _isCreation  交易是否是合约创建
+    /// @param _data        触发接收者的数据
     function depositTransaction(
         address _to,
         uint256 _value,
@@ -571,50 +632,55 @@ contract OptimismPortal2 is Initializable, ResourceMetering, ReinitializableBase
     )
         public
         payable
-        metered(_gasLimit)
+        metered(_gasLimit)  // ResourceMetering 修饰符，用于计量资源使用
     {
+        // 如果启用了自定义 Gas Token 模式，不能发送 ETH
         if (_isUsingCustomGasToken()) {
             if (msg.value > 0) revert OptimismPortal_NotAllowedOnCGTMode();
         }
 
-        // If using ETHLockbox, lock the ETH in the ETHLockbox.
+        // 如果使用 ETHLockbox，将 ETH 锁定在 ETHLockbox 中
+        // ETHLockbox 是一个特殊的合约，用于管理 ETH 的锁定和解锁
+        // 当存款到达 L2 时，ETH 会在 L2 上被铸造
         if (_isUsingLockbox()) {
             if (msg.value > 0) ethLockbox.lockETH{ value: msg.value }();
         }
 
-        // Just to be safe, make sure that people specify address(0) as the target when doing
-        // contract creations.
+        // 安全检查：合约创建时必须指定 address(0) 作为目标
         if (_isCreation && _to != address(0)) {
             revert OptimismPortal_BadTarget();
         }
 
-        // Prevent depositing transactions that have too small of a gas limit. Users should pay
-        // more for more resource usage.
+        // 防止存款交易的 gas 限制太小
+        // 最小 gas 限制根据 calldata 大小线性增加，防止用户不支付资源使用费用
         if (_gasLimit < minimumGasLimit(uint64(_data.length))) {
             revert OptimismPortal_GasLimitTooLow();
         }
 
-        // Prevent the creation of deposit transactions that have too much calldata. This gives an
-        // upper limit on the size of unsafe blocks over the p2p network. 120kb is chosen to ensure
-        // that the transaction can fit into the p2p network policy of 128kb even though deposit
-        // transactions are not gossipped over the p2p network.
+        // 防止创建 calldata 过大的存款交易
+        // 120kb 的限制确保交易可以适应 p2p 网络的 128kb 策略
+        // 即使存款交易不在 p2p 网络上传播
         if (_data.length > 120_000) {
             revert OptimismPortal_CalldataTooLarge();
         }
 
-        // Transform the from-address to its alias if the caller is a contract.
+        // 如果调用者是合约，将 from 地址转换为别名
+        // 地址别名化是 Optimism 的安全机制，防止 L1 合约地址与 L2 地址冲突
+        // 别名公式：L2地址 = L1地址 + 0x1111000000000000000000000000000000001111
         address from = msg.sender;
         if (!EOA.isSenderEOA()) {
             from = AddressAliasHelper.applyL1ToL2Alias(msg.sender);
         }
 
-        // Compute the opaque data that will be emitted as part of the TransactionDeposited event.
-        // We use opaque data so that we can update the TransactionDeposited event in the future
-        // without breaking the current interface.
+        // 计算不透明数据，将作为 TransactionDeposited 事件的一部分发出
+        // 使用不透明数据允许我们在未来更新 TransactionDeposited 事件而不破坏当前接口
         bytes memory opaqueData = abi.encodePacked(msg.value, _value, _gasLimit, _isCreation, _data);
 
-        // Emit a TransactionDeposited event so that the rollup node can derive a deposit
-        // transaction for this deposit.
+        // 发出 TransactionDeposited 事件，Rollup 节点监听此事件并在 L2 上派生存款交易
+        // Rollup 节点会：
+        // 1. 监听此事件
+        // 2. 解析 opaqueData
+        // 3. 在 L2 上构建并执行相应的存款交易
         emit TransactionDeposited(from, _to, DEPOSIT_VERSION, opaqueData);
     }
 

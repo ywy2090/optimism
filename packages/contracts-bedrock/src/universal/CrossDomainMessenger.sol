@@ -80,12 +80,32 @@ contract CrossDomainMessengerLegacySpacer1 {
 
 /// @custom:upgradeable
 /// @title CrossDomainMessenger
-/// @notice CrossDomainMessenger is a base contract that provides the core logic for the L1 and L2
-///         cross-chain messenger contracts. It's designed to be a universal interface that only
-///         needs to be extended slightly to provide low-level message passing functionality on each
-///         chain it's deployed on. Currently only designed for message passing between two paired
-///         chains and does not support one-to-many interactions.
-///         Any changes to this contract MUST result in a semver bump for contracts that inherit it.
+/// @notice CrossDomainMessenger 是 L1 和 L2 跨链消息传递合约的基类，提供核心的消息传递逻辑。
+/// 
+/// 核心功能：
+/// 1. **发送消息（sendMessage）**：向对侧链发送消息
+///    - 消息包含目标地址、消息数据、最小 gas 限制
+///    - 可以附带 ETH 值
+///    - 消息通过底层机制（如 OptimismPortal）传递到对侧链
+/// 
+/// 2. **中继消息（relayMessage）**：在对侧链上执行收到的消息
+///    - 验证消息来源和完整性
+///    - 检查重放保护
+///    - 执行目标合约调用
+///    - 处理成功/失败状态
+/// 
+/// 安全机制：
+/// - 消息哈希验证：防止消息被篡改
+/// - 重放保护：使用 successfulMessages 映射防止重复执行
+/// - 失败消息跟踪：使用 failedMessages 映射允许重放失败的消息
+/// - Gas 检查：确保有足够的 gas 执行目标调用
+/// - 重入保护：使用 xDomainMsgSender 防止重入
+/// 
+/// 设计限制：
+/// - 目前只支持两个配对链之间的消息传递
+/// - 不支持一对多的交互
+/// 
+/// 重要：对此合约的任何更改都必须导致继承合约的 semver 版本号增加。
 abstract contract CrossDomainMessenger is
     CrossDomainMessengerLegacySpacer0,
     Initializable,
@@ -129,15 +149,25 @@ abstract contract CrossDomainMessenger is
     ///         empty message.
     uint64 public constant ENCODING_OVERHEAD = 260;
 
-    /// @notice Mapping of message hashes to boolean receipt values. Note that a message will only
-    ///         be present in this mapping if it has successfully been relayed on this chain, and
-    ///         can therefore not be relayed again.
+    /// @notice 消息哈希到布尔值的映射，用于重放保护
+    /// 
+    /// 用途：
+    /// - 记录已成功中继的消息哈希
+    /// - 防止消息被重复执行（重放攻击）
+    /// 
+    /// 注意：只有成功中继的消息才会出现在此映射中，因此不能再次中继。
     mapping(bytes32 => bool) public successfulMessages;
 
-    /// @notice Address of the sender of the currently executing message on the other chain. If the
-    ///         value of this variable is the default value (0x00000000...dead) then no message is
-    ///         currently being executed. Use the xDomainMessageSender getter which will throw an
-    ///         error if this is the case.
+    /// @notice 当前正在执行的消息在对侧链上的发送者地址
+    /// 
+    /// 用途：
+    /// - 在消息中继期间，存储对侧链的发送者地址
+    /// - 允许被调用的合约知道是谁在对侧链触发了调用
+    /// - 作为重入保护机制（如果值不是默认值，说明正在处理消息）
+    /// 
+    /// 默认值：Constants.DEFAULT_L2_SENDER（0x00000000...dead）
+    /// 如果值等于默认值，说明当前没有消息正在执行。
+    /// 使用 xDomainMessageSender getter 函数，如果值未设置会抛出错误。
     address internal xDomainMsgSender;
 
     /// @notice Nonce for the next message to be sent, without the message version applied. Use the
@@ -145,9 +175,17 @@ abstract contract CrossDomainMessenger is
     ///         the actual nonce to be used for the message.
     uint240 internal msgNonce;
 
-    /// @notice Mapping of message hashes to a boolean if and only if the message has failed to be
-    ///         executed at least once. A message will not be present in this mapping if it
-    ///         successfully executed on the first attempt.
+    /// @notice 消息哈希到布尔值的映射，记录失败的消息
+    /// 
+    /// 用途：
+    /// - 记录至少执行失败一次的消息哈希
+    /// - 允许失败的消息被重放（通过手动调用 relayMessage）
+    /// - 如果消息第一次执行就成功，不会出现在此映射中
+    /// 
+    /// 失败原因可能包括：
+    /// - Gas 不足
+    /// - 目标合约调用失败
+    /// - 重入检测
     mapping(bytes32 => bool) public failedMessages;
 
     /// @notice CrossDomainMessenger contract on the other chain.
@@ -181,44 +219,77 @@ abstract contract CrossDomainMessenger is
     /// @param msgHash Hash of the message that failed to be relayed.
     event FailedRelayedMessage(bytes32 indexed msgHash);
 
-    /// @notice Sends a message to some target address on the other chain. Note that if the call
-    ///         always reverts, then the message will be unrelayable, and any ETH sent will be
-    ///         permanently locked. The same will occur if the target on the other chain is
-    ///         considered unsafe (see the _isUnsafeTarget() function).
-    /// @param _target      Target contract or wallet address.
-    /// @param _message     Message to trigger the target address with.
-    /// @param _minGasLimit Minimum gas limit that the message can be executed with.
+    /// @notice 向对侧链的某个目标地址发送消息
+    /// 
+    /// 这是跨链消息传递的第一阶段。消息会被编码并发送到对侧链的 CrossDomainMessenger。
+    /// 
+    /// 重要警告：
+    /// - 如果目标合约的调用总是回滚，消息将无法中继，发送的 ETH 将永久锁定
+    /// - 如果对侧链的目标地址被认为不安全（见 _isUnsafeTarget()），也会发生同样的情况
+    /// 
+    /// Gas 计算：
+    /// - 提供给消息的 gas = 用户请求的 gas + 基础 gas 值
+    /// - 这保证了目标合约调用始终至少有用户指定的最小 gas 限制
+    /// 
+    /// 消息编码：
+    /// - 消息被编码为调用 relayMessage 的格式
+    /// - 包含：nonce、sender、target、value、minGasLimit、message
+    /// 
+    /// @param _target      目标合约或钱包地址（在对侧链）
+    /// @param _message     触发目标地址的消息数据
+    /// @param _minGasLimit 消息可以执行的最小 gas 限制
     function sendMessage(address _target, bytes calldata _message, uint32 _minGasLimit) external payable {
-        // Triggers a message to the other messenger. Note that the amount of gas provided to the
-        // message is the amount of gas requested by the user PLUS the base gas value. We want to
-        // guarantee the property that the call to the target contract will always have at least
-        // the minimum gas limit specified by the user.
+        // 触发发送消息到对侧链的 messenger
+        // 注意：提供给消息的 gas = 用户请求的 gas + 基础 gas 值
+        // 这保证了目标合约调用始终至少有用户指定的最小 gas 限制
         _sendMessage({
-            _to: address(otherMessenger),
-            _gasLimit: baseGas(_message, _minGasLimit),
-            _value: msg.value,
+            _to: address(otherMessenger),  // 对侧链的 CrossDomainMessenger
+            _gasLimit: baseGas(_message, _minGasLimit),  // 计算总 gas（用户 gas + 基础 gas）
+            _value: msg.value,  // 附带的 ETH 值
             _data: abi.encodeWithSelector(
-                this.relayMessage.selector, messageNonce(), msg.sender, _target, msg.value, _minGasLimit, _message
+                this.relayMessage.selector,  // 对侧链将调用 relayMessage
+                messageNonce(),              // 消息 nonce
+                msg.sender,                  // 发送者地址
+                _target,                     // 目标地址
+                msg.value,                   // ETH 值
+                _minGasLimit,                // 最小 gas 限制
+                _message                     // 消息数据
             )
         });
 
+        // 发出消息发送事件
         emit SentMessage(_target, msg.sender, _message, messageNonce(), _minGasLimit);
         emit SentMessageExtension1(msg.sender, msg.value);
 
+        // 增加 nonce（用于下一个消息）
         unchecked {
             ++msgNonce;
         }
     }
 
-    /// @notice Relays a message that was sent by the other CrossDomainMessenger contract. Can only
-    ///         be executed via cross-chain call from the other messenger OR if the message was
-    ///         already received once and is currently being replayed.
-    /// @param _nonce       Nonce of the message being relayed.
-    /// @param _sender      Address of the user who sent the message.
-    /// @param _target      Address that the message is targeted at.
-    /// @param _value       ETH value to send with the message.
-    /// @param _minGasLimit Minimum amount of gas that the message can be executed with.
-    /// @param _message     Message to send to the target.
+    /// @notice 中继由对侧链 CrossDomainMessenger 发送的消息
+    /// 
+    /// 这是跨链消息传递的第二阶段。在对侧链上执行收到的消息。
+    /// 
+    /// 执行条件：
+    /// 1. 首次中继：只能通过对侧链 messenger 的跨链调用执行
+    /// 2. 重放：如果消息之前失败，可以手动重放
+    /// 
+    /// 验证流程：
+    /// 1. 检查合约未暂停
+    /// 2. 验证消息版本（支持版本 0 和 1）
+    /// 3. 版本 0 消息：检查传统消息哈希未被中继
+    /// 4. 计算版本化消息哈希（v1 哈希包含 value 和 minGasLimit）
+    /// 5. 验证消息来源和重放状态
+    /// 6. 检查目标地址安全
+    /// 7. 检查消息未被成功中继过
+    /// 
+    /// @param _nonce       正在中继的消息的 nonce
+    /// @param _sender      发送消息的用户地址（在对侧链）
+    /// @param _target      消息的目标地址（在本链）
+    /// @param _value       随消息发送的 ETH 值
+    /// @param _minGasLimit 消息可以执行的最小 gas 数量
+    /// @param _message     发送给目标的消息数据
     function relayMessage(
         uint256 _nonce,
         address _sender,
@@ -230,63 +301,68 @@ abstract contract CrossDomainMessenger is
         external
         payable
     {
-        // On L1 this function will check the Portal for its paused status.
-        // On L2 this function should be a no-op, because paused will always return false.
+        // 检查合约未暂停
+        // 在 L1 上，此函数会检查 Portal 的暂停状态
+        // 在 L2 上，这应该是一个空操作，因为 paused 总是返回 false
         require(paused() == false, "CrossDomainMessenger: paused");
 
+        // 解码 nonce 获取消息版本
         (, uint16 version) = Encoding.decodeVersionedNonce(_nonce);
         require(version < 2, "CrossDomainMessenger: only version 0 or 1 messages are supported at this time");
 
-        // If the message is version 0, then it's a migrated legacy withdrawal. We therefore need
-        // to check that the legacy version of the message has not already been relayed.
+        // 如果消息是版本 0，这是迁移的传统提款
+        // 需要检查传统版本的消息未被中继过
         if (version == 0) {
             bytes32 oldHash = Hashing.hashCrossDomainMessageV0(_target, _sender, _message, _nonce);
             require(successfulMessages[oldHash] == false, "CrossDomainMessenger: legacy withdrawal already relayed");
         }
 
-        // We use the v1 message hash as the unique identifier for the message because it commits
-        // to the value and minimum gas limit of the message.
+        // 使用 v1 消息哈希作为消息的唯一标识符
+        // v1 哈希包含 value 和 minGasLimit，提供更强的承诺
         bytes32 versionedHash =
             Hashing.hashCrossDomainMessageV1(_nonce, _sender, _target, _value, _minGasLimit, _message);
 
+        // 验证消息来源和重放状态
         if (_isOtherMessenger()) {
-            // These properties should always hold when the message is first submitted (as
-            // opposed to being replayed).
-            assert(msg.value == _value);
-            assert(!failedMessages[versionedHash]);
+            // 首次提交消息时（非重放），这些属性应该始终成立
+            assert(msg.value == _value);  // ETH 值必须匹配
+            assert(!failedMessages[versionedHash]);  // 消息不应该已经失败
         } else {
+            // 重放失败的消息时
             require(msg.value == 0, "CrossDomainMessenger: value must be zero unless message is from a system address");
-
             require(failedMessages[versionedHash], "CrossDomainMessenger: message cannot be replayed");
         }
 
+        // 检查目标地址不是被阻止的系统地址
         require(
             _isUnsafeTarget(_target) == false, "CrossDomainMessenger: cannot send message to blocked system address"
         );
 
+        // 检查消息未被成功中继过（重放保护）
         require(successfulMessages[versionedHash] == false, "CrossDomainMessenger: message has already been relayed");
 
-        // If there is not enough gas left to perform the external call and finish the execution,
-        // return early and assign the message to the failedMessages mapping.
-        // We are asserting that we have enough gas to:
-        // 1. Call the target contract (_minGasLimit + RELAY_CALL_OVERHEAD + RELAY_GAS_CHECK_BUFFER)
-        //   1.a. The RELAY_CALL_OVERHEAD is included in `hasMinGas`.
-        // 2. Finish the execution after the external call (RELAY_RESERVED_GAS).
+        // Gas 检查和重入保护
+        // 如果没有足够的 gas 执行外部调用并完成执行，提前返回并将消息标记为失败
+        // 
+        // 我们需要确保有足够的 gas 来：
+        // 1. 调用目标合约（_minGasLimit + RELAY_CALL_OVERHEAD + RELAY_GAS_CHECK_BUFFER）
+        //    - RELAY_CALL_OVERHEAD 包含在 `hasMinGas` 中
+        // 2. 在外部调用后完成执行（RELAY_RESERVED_GAS）
         //
-        // If `xDomainMsgSender` is not the default L2 sender, this function
-        // is being re-entered. This marks the message as failed to allow it to be replayed.
+        // 如果 `xDomainMsgSender` 不是默认的 L2 发送者，说明此函数正在被重入
+        // 这会将消息标记为失败，允许稍后重放
         if (
             !SafeCall.hasMinGas(_minGasLimit, RELAY_RESERVED_GAS + RELAY_GAS_CHECK_BUFFER)
                 || xDomainMsgSender != Constants.DEFAULT_L2_SENDER
         ) {
+            // 标记消息为失败
             failedMessages[versionedHash] = true;
             emit FailedRelayedMessage(versionedHash);
 
-            // Revert in this case if the transaction was triggered by the estimation address. This
-            // should only be possible during gas estimation or we have bigger problems. Reverting
-            // here will make the behavior of gas estimation change such that the gas limit
-            // computed will be the amount required to relay the message, even if that amount is
-            // greater than the minimum gas limit specified by the user.
+            // 如果交易由估算地址触发，回滚
+            // 这应该只在 gas 估算期间可能，或者我们有更大的问题
+            // 回滚将使 gas 估算行为改变，使得计算的 gas 限制是中继消息所需的数量，
+            // 即使该数量大于用户指定的最小 gas 限制
             if (tx.origin == Constants.ESTIMATION_ADDRESS) {
                 revert("CrossDomainMessenger: failed to relay message");
             }
@@ -294,36 +370,49 @@ abstract contract CrossDomainMessenger is
             return;
         }
 
+        // 设置跨域消息发送者（允许被调用的合约知道是谁在对侧链触发了调用）
         xDomainMsgSender = _sender;
+        
+        // 执行目标合约调用
+        // 使用 SafeCall.call 确保即使目标合约回滚，也不会影响整个交易
+        // 保留 RELAY_RESERVED_GAS 用于后续执行
         bool success = SafeCall.call(_target, gasleft() - RELAY_RESERVED_GAS, _value, _message);
+        
+        // 重置跨域消息发送者（重入保护）
         xDomainMsgSender = Constants.DEFAULT_L2_SENDER;
 
+        // 处理调用结果
         if (success) {
-            // This check is identical to one above, but it ensures that the same message cannot be relayed
-            // twice, and adds a layer of protection against rentrancy.
+            // 再次检查消息未被成功中继（与上面的检查相同）
+            // 这确保同一消息不能被中继两次，并增加一层重入保护
             assert(successfulMessages[versionedHash] == false);
+            
+            // 标记消息为成功中继
             successfulMessages[versionedHash] = true;
             emit RelayedMessage(versionedHash);
         } else {
+            // 调用失败，标记消息为失败（允许稍后重放）
             failedMessages[versionedHash] = true;
             emit FailedRelayedMessage(versionedHash);
 
-            // Revert in this case if the transaction was triggered by the estimation address. This
-            // should only be possible during gas estimation or we have bigger problems. Reverting
-            // here will make the behavior of gas estimation change such that the gas limit
-            // computed will be the amount required to relay the message, even if that amount is
-            // greater than the minimum gas limit specified by the user.
+            // 如果交易由估算地址触发，回滚
             if (tx.origin == Constants.ESTIMATION_ADDRESS) {
                 revert("CrossDomainMessenger: failed to relay message");
             }
         }
     }
 
-    /// @notice Retrieves the address of the contract or wallet that initiated the currently
-    ///         executing message on the other chain. Will throw an error if there is no message
-    ///         currently being executed. Allows the recipient of a call to see who triggered it.
-    /// @return Address of the sender of the currently executing message on the other chain.
+    /// @notice 获取在对侧链上发起当前正在执行的消息的合约或钱包地址
+    /// 
+    /// 用途：
+    /// - 允许消息接收者查看是谁在对侧链触发了调用
+    /// - 用于权限检查和访问控制
+    /// 
+    /// 如果当前没有消息正在执行，将抛出错误。
+    /// 
+    /// @return 在对侧链上发送当前正在执行的消息的地址
     function xDomainMessageSender() external view returns (address) {
+        // 如果 xDomainMsgSender 是默认值，说明没有消息正在执行
         require(
             xDomainMsgSender != Constants.DEFAULT_L2_SENDER, "CrossDomainMessenger: xDomainMessageSender is not set"
         );

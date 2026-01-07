@@ -18,9 +18,23 @@ import { ICrossDomainMessenger } from "interfaces/universal/ICrossDomainMessenge
 
 /// @custom:upgradeable
 /// @title StandardBridge
-/// @notice StandardBridge is a base contract for the L1 and L2 standard ERC20 bridges. It handles
-///         the core bridging logic, including escrowing tokens that are native to the local chain
-///         and minting/burning tokens that are native to the remote chain.
+/// @notice StandardBridge 是 L1 和 L2 标准 ERC20 桥接合约的基类。
+/// 
+/// 核心功能：
+/// 1. **桥接发起**：处理从本地链到远程链的资产桥接
+/// 2. **桥接确认**：处理从远程链到本地链的桥接最终确认
+/// 3. **代币管理**：
+///    - 本地链原生代币：在本地链锁定（escrow），在远程链铸造
+///    - 远程链原生代币：在本地链销毁，在远程链转移
+/// 
+/// 桥接流程：
+/// - **发起桥接**：用户调用 bridgeETH/bridgeERC20 → 通过 CrossDomainMessenger 发送消息
+/// - **最终确认**：远程链的桥接合约通过 CrossDomainMessenger 调用 finalizeBridgeETH/finalizeBridgeERC20
+/// 
+/// 安全机制：
+/// - onlyEOA：防止智能合约钱包意外桥接
+/// - onlyOtherBridge：确保只有对侧链的桥接合约可以最终确认
+/// - paused()：支持暂停机制
 abstract contract StandardBridge is Initializable {
     using SafeERC20 for IERC20;
 
@@ -37,7 +51,17 @@ abstract contract StandardBridge is Initializable {
     /// @notice Spacer for backwards compatibility.
     address private spacer_1_0_20;
 
-    /// @notice Mapping that stores deposits for a given pair of local and remote tokens.
+    /// @notice 存储本地代币和远程代币对的存款数量
+    /// 
+    /// 映射结构：deposits[localToken][remoteToken] = amount
+    /// 
+    /// 用途：
+    /// - 对于本地链原生代币（非 OptimismMintableERC20），记录锁定在桥接合约中的数量
+    /// - 当远程链的桥接最终确认时，从这个映射中扣除相应的数量
+    /// 
+    /// 示例：
+    /// - L1 上的 USDC（本地代币）桥接到 L2：deposits[L1_USDC][L2_USDC] += amount
+    /// - L2 上的桥接最终确认时：deposits[L1_USDC][L2_USDC] -= amount
     mapping(address => mapping(address => uint256)) public deposits;
 
     /// @notice Messenger contract on this domain.
@@ -99,15 +123,24 @@ abstract contract StandardBridge is Initializable {
         bytes extraData
     );
 
-    /// @notice Only allow EOAs to call the functions. Note that this is not safe against contracts
-    ///         calling code within their constructors, but also doesn't really matter since we're
-    ///         just trying to prevent users accidentally depositing with smart contract wallets.
+    /// @notice 只允许外部账户（EOA）调用函数
+    /// 
+    /// 安全考虑：
+    /// - 防止智能合约钱包意外桥接资产
+    /// - 注意：这不完全安全，因为合约可以在构造函数中调用代码
+    /// - 但主要目的是防止用户意外使用智能合约钱包进行桥接
     modifier onlyEOA() {
         require(EOA.isSenderEOA(), "StandardBridge: function can only be called from an EOA");
         _;
     }
 
-    /// @notice Ensures that the caller is a cross-chain message from the other bridge.
+    /// @notice 确保调用者是对侧链桥接合约通过跨链消息发送的
+    /// 
+    /// 验证逻辑：
+    /// 1. msg.sender 必须是 messenger 合约地址
+    /// 2. messenger.xDomainMessageSender() 必须是对侧链的桥接合约地址
+    /// 
+    /// 这是关键的安全检查，确保只有对侧链的桥接合约可以最终确认桥接操作
     modifier onlyOtherBridge() {
         require(
             msg.sender == address(messenger) && messenger.xDomainMessageSender() == address(otherBridge),
@@ -158,27 +191,29 @@ abstract contract StandardBridge is Initializable {
         return false;
     }
 
-    /// @notice Sends ETH to the sender's address on the other chain.
-    /// @param _minGasLimit Minimum amount of gas that the bridge can be relayed with.
-    /// @param _extraData   Extra data to be sent with the transaction. Note that the recipient will
-    ///                     not be triggered with this data, but it will be emitted and can be used
-    ///                     to identify the transaction.
+    /// @notice 将 ETH 桥接到发送者在对侧链的地址
+    /// 
+    /// 流程：
+    /// 1. 接收 ETH（通过 msg.value）
+    /// 2. 通过 CrossDomainMessenger 发送消息到对侧链的桥接合约
+    /// 3. 对侧链的桥接合约最终确认并转账 ETH
+    /// 
+    /// @param _minGasLimit 桥接可以中继的最小 gas 数量
+    /// @param _extraData    额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function bridgeETH(uint32 _minGasLimit, bytes calldata _extraData) public payable onlyEOA {
         _initiateBridgeETH(msg.sender, msg.sender, msg.value, _minGasLimit, _extraData);
     }
 
-    /// @notice Sends ETH to a receiver's address on the other chain. Note that if ETH is sent to a
-    ///         smart contract and the call fails, the ETH will be temporarily locked in the
-    ///         StandardBridge on the other chain until the call is replayed. If the call cannot be
-    ///         replayed with any amount of gas (call always reverts), then the ETH will be
-    ///         permanently locked in the StandardBridge on the other chain. ETH will also
-    ///         be locked if the receiver is the other bridge, because finalizeBridgeETH will revert
-    ///         in that case.
-    /// @param _to          Address of the receiver.
-    /// @param _minGasLimit Minimum amount of gas that the bridge can be relayed with.
-    /// @param _extraData   Extra data to be sent with the transaction. Note that the recipient will
-    ///                     not be triggered with this data, but it will be emitted and can be used
-    ///                     to identify the transaction.
+    /// @notice 将 ETH 桥接到指定接收者在对侧链的地址
+    /// 
+    /// 重要警告：
+    /// - 如果 ETH 发送到智能合约且调用失败，ETH 会暂时锁定在对侧链的 StandardBridge 中
+    /// - 如果调用无法用任何数量的 gas 重放（总是回滚），ETH 将永久锁定
+    /// - 如果接收者是对侧链的桥接合约，ETH 也会被锁定（因为 finalizeBridgeETH 会回滚）
+    /// 
+    /// @param _to          接收者地址
+    /// @param _minGasLimit 桥接可以中继的最小 gas 数量
+    /// @param _extraData   额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function bridgeETHTo(address _to, uint32 _minGasLimit, bytes calldata _extraData) public payable {
         _initiateBridgeETH(msg.sender, _to, msg.value, _minGasLimit, _extraData);
     }
@@ -228,14 +263,23 @@ abstract contract StandardBridge is Initializable {
         _initiateBridgeERC20(_localToken, _remoteToken, msg.sender, _to, _amount, _minGasLimit, _extraData);
     }
 
-    /// @notice Finalizes an ETH bridge on this chain. Can only be triggered by the other
-    ///         StandardBridge contract on the remote chain.
-    /// @param _from      Address of the sender.
-    /// @param _to        Address of the receiver.
-    /// @param _amount    Amount of ETH being bridged.
-    /// @param _extraData Extra data to be sent with the transaction. Note that the recipient will
-    ///                   not be triggered with this data, but it will be emitted and can be used
-    ///                   to identify the transaction.
+    /// @notice 在本链上最终确认 ETH 桥接
+    /// 
+    /// 这是桥接流程的第二阶段（第一阶段在对侧链发起）。
+    /// 只能由对侧链的 StandardBridge 合约通过跨链消息触发。
+    /// 
+    /// 流程：
+    /// 1. 验证调用来源（onlyOtherBridge 修饰符）
+    /// 2. 检查合约未暂停
+    /// 3. 验证发送的 ETH 数量匹配
+    /// 4. 验证目标地址安全（不能是桥接合约自身或 messenger）
+    /// 5. 发出事件
+    /// 6. 执行 ETH 转账
+    /// 
+    /// @param _from      发送者地址（在对侧链）
+    /// @param _to        接收者地址（在本链）
+    /// @param _amount    桥接的 ETH 数量
+    /// @param _extraData 额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function finalizeBridgeETH(
         address _from,
         address _to,
@@ -244,31 +288,52 @@ abstract contract StandardBridge is Initializable {
     )
         public
         payable
-        onlyOtherBridge
+        onlyOtherBridge  // 关键安全检查：只能由对侧链的桥接合约调用
     {
+        // 检查合约未暂停
         require(paused() == false, "StandardBridge: paused");
+        
+        // 验证发送的 ETH 数量必须等于桥接数量
+        // 这些 ETH 来自 CrossDomainMessenger，它从对侧链的桥接合约接收
         require(msg.value == _amount, "StandardBridge: amount sent does not match amount required");
+        
+        // 安全检查：不能发送到桥接合约自身（防止资金锁定）
         require(_to != address(this), "StandardBridge: cannot send to self");
+        
+        // 安全检查：不能发送到 messenger（防止资金锁定）
         require(_to != address(messenger), "StandardBridge: cannot send to messenger");
 
-        // Emit the correct events. By default this will be _amount, but child
-        // contracts may override this function in order to emit legacy events as well.
+        // 发出桥接最终确认事件
+        // 子合约可以重写此函数以发出传统事件
         _emitETHBridgeFinalized(_from, _to, _amount, _extraData);
 
+        // 使用 SafeCall 执行 ETH 转账
+        // SafeCall.call 确保即使目标合约回滚，也不会影响整个交易
         bool success = SafeCall.call(_to, gasleft(), _amount, hex"");
         require(success, "StandardBridge: ETH transfer failed");
     }
 
-    /// @notice Finalizes an ERC20 bridge on this chain. Can only be triggered by the other
-    ///         StandardBridge contract on the remote chain.
-    /// @param _localToken  Address of the ERC20 on this chain.
-    /// @param _remoteToken Address of the corresponding token on the remote chain.
-    /// @param _from        Address of the sender.
-    /// @param _to          Address of the receiver.
-    /// @param _amount      Amount of the ERC20 being bridged.
-    /// @param _extraData   Extra data to be sent with the transaction. Note that the recipient will
-    ///                     not be triggered with this data, but it will be emitted and can be used
-    ///                     to identify the transaction.
+    /// @notice 在本链上最终确认 ERC20 桥接
+    /// 
+    /// 这是桥接流程的第二阶段（第一阶段在对侧链发起）。
+    /// 只能由对侧链的 StandardBridge 合约通过跨链消息触发。
+    /// 
+    /// 代币处理逻辑：
+    /// 1. **OptimismMintableERC20（远程链原生代币）**：
+    ///    - 在对侧链被销毁，在本链铸造
+    ///    - 验证代币对正确性
+    ///    - 调用 mint() 铸造代币给接收者
+    /// 
+    /// 2. **本地链原生代币**：
+    ///    - 在对侧链被锁定，在本链从 deposits 映射中扣除
+    ///    - 从桥接合约转账给接收者
+    /// 
+    /// @param _localToken  本链上的 ERC20 代币地址
+    /// @param _remoteToken 对侧链上对应的 ERC20 代币地址
+    /// @param _from         发送者地址（在对侧链）
+    /// @param _to           接收者地址（在本链）
+    /// @param _amount       桥接的 ERC20 数量
+    /// @param _extraData    额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function finalizeBridgeERC20(
         address _localToken,
         address _remoteToken,
@@ -278,34 +343,57 @@ abstract contract StandardBridge is Initializable {
         bytes calldata _extraData
     )
         public
-        onlyOtherBridge
+        onlyOtherBridge  // 关键安全检查：只能由对侧链的桥接合约调用
     {
+        // 检查合约未暂停
         require(paused() == false, "StandardBridge: paused");
+        
+        // 判断代币类型并处理
         if (_isOptimismMintableERC20(_localToken)) {
+            // 情况 1：OptimismMintableERC20（远程链原生代币）
+            // 验证代币对正确性：本地代币的 remoteToken 必须等于传入的 _remoteToken
             require(
                 _isCorrectTokenPair(_localToken, _remoteToken),
                 "StandardBridge: wrong remote token for Optimism Mintable ERC20 local token"
             );
 
+            // 在对侧链代币已被销毁，这里在本链铸造
             IOptimismMintableERC20(_localToken).mint(_to, _amount);
         } else {
+            // 情况 2：本地链原生代币
+            // 从 deposits 映射中扣除数量（这些代币在发起桥接时被锁定）
             deposits[_localToken][_remoteToken] = deposits[_localToken][_remoteToken] - _amount;
+            
+            // 从桥接合约转账给接收者
             IERC20(_localToken).safeTransfer(_to, _amount);
         }
 
-        // Emit the correct events. By default this will be ERC20BridgeFinalized, but child
-        // contracts may override this function in order to emit legacy events as well.
+        // 发出桥接最终确认事件
+        // 子合约可以重写此函数以发出传统事件
         _emitERC20BridgeFinalized(_localToken, _remoteToken, _from, _to, _amount, _extraData);
     }
 
-    /// @notice Initiates a bridge of ETH through the CrossDomainMessenger.
-    /// @param _from        Address of the sender.
-    /// @param _to          Address of the receiver.
-    /// @param _amount      Amount of ETH being bridged.
-    /// @param _minGasLimit Minimum amount of gas that the bridge can be relayed with.
-    /// @param _extraData   Extra data to be sent with the transaction. Note that the recipient will
-    ///                     not be triggered with this data, but it will be emitted and can be used
-    ///                     to identify the transaction.
+    /// @notice 通过 CrossDomainMessenger 发起 ETH 桥接
+    /// 
+    /// 这是桥接流程的第一阶段（内部函数）。
+    /// 
+    /// 流程：
+    /// 1. 验证发送的 ETH 数量
+    /// 2. 发出桥接发起事件
+    /// 3. 通过 CrossDomainMessenger 发送消息到对侧链的桥接合约
+    /// 4. 对侧链的桥接合约收到消息后调用 finalizeBridgeETH 完成桥接
+    /// 
+    /// 消息内容：
+    /// - 目标：对侧链的桥接合约（otherBridge）
+    /// - 函数：finalizeBridgeETH
+    /// - 参数：from, to, amount, extraData
+    /// - 附带 ETH：_amount（通过 { value: _amount } 发送）
+    /// 
+    /// @param _from        发送者地址
+    /// @param _to          接收者地址（在对侧链）
+    /// @param _amount      桥接的 ETH 数量
+    /// @param _minGasLimit 桥接可以中继的最小 gas 数量
+    /// @param _extraData   额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function _initiateBridgeETH(
         address _from,
         address _to,
@@ -315,28 +403,55 @@ abstract contract StandardBridge is Initializable {
     )
         internal
     {
+        // 验证发送的 ETH 数量必须等于桥接数量
         require(msg.value == _amount, "StandardBridge: bridging ETH must include sufficient ETH value");
 
-        // Emit the correct events. By default this will be _amount, but child
-        // contracts may override this function in order to emit legacy events as well.
+        // 发出桥接发起事件
+        // 子合约可以重写此函数以发出传统事件
         _emitETHBridgeInitiated(_from, _to, _amount, _extraData);
 
+        // 通过 CrossDomainMessenger 发送消息到对侧链
+        // 消息包含调用 finalizeBridgeETH 的编码数据
+        // ETH 通过 { value: _amount } 附带在消息中
         messenger.sendMessage{ value: _amount }({
-            _target: address(otherBridge),
-            _message: abi.encodeWithSelector(this.finalizeBridgeETH.selector, _from, _to, _amount, _extraData),
+            _target: address(otherBridge),  // 对侧链的桥接合约
+            _message: abi.encodeWithSelector(
+                this.finalizeBridgeETH.selector,  // 函数选择器
+                _from, 
+                _to, 
+                _amount, 
+                _extraData
+            ),
             _minGasLimit: _minGasLimit
         });
     }
 
-    /// @notice Sends ERC20 tokens to a receiver's address on the other chain.
-    /// @param _localToken  Address of the ERC20 on this chain.
-    /// @param _remoteToken Address of the corresponding token on the remote chain.
-    /// @param _to          Address of the receiver.
-    /// @param _amount      Amount of local tokens to deposit.
-    /// @param _minGasLimit Minimum amount of gas that the bridge can be relayed with.
-    /// @param _extraData   Extra data to be sent with the transaction. Note that the recipient will
-    ///                     not be triggered with this data, but it will be emitted and can be used
-    ///                     to identify the transaction.
+    /// @notice 将对侧链的接收者地址发送 ERC20 代币
+    /// 
+    /// 这是桥接流程的第一阶段（内部函数）。
+    /// 
+    /// 代币处理逻辑：
+    /// 1. **OptimismMintableERC20（远程链原生代币）**：
+    ///    - 验证代币对正确性
+    ///    - 在本链销毁代币（burn）
+    ///    - 在对侧链最终确认时会铸造
+    /// 
+    /// 2. **本地链原生代币**：
+    ///    - 从用户转账到桥接合约（锁定）
+    ///    - 更新 deposits 映射
+    ///    - 在对侧链最终确认时会从 deposits 扣除并转账
+    /// 
+    /// 消息发送：
+    /// - 注意：代币地址顺序在消息中被反转
+    /// - 因为消息在对侧链执行，对侧链的 localToken 是本链的 remoteToken
+    /// 
+    /// @param _localToken  本链上的 ERC20 代币地址
+    /// @param _remoteToken 对侧链上对应的 ERC20 代币地址
+    /// @param _from        发送者地址
+    /// @param _to          接收者地址（在对侧链）
+    /// @param _amount      要桥接的本地代币数量
+    /// @param _minGasLimit 桥接可以中继的最小 gas 数量
+    /// @param _extraData   额外数据，不会触发接收者，但会发出事件，可用于识别交易
     function _initiateBridgeERC20(
         address _localToken,
         address _remoteToken,
@@ -348,33 +463,43 @@ abstract contract StandardBridge is Initializable {
     )
         internal
     {
+        // 验证不能同时发送 ETH（ERC20 桥接不涉及 ETH）
         require(msg.value == 0, "StandardBridge: cannot send value");
 
+        // 判断代币类型并处理
         if (_isOptimismMintableERC20(_localToken)) {
+            // 情况 1：OptimismMintableERC20（远程链原生代币）
+            // 验证代币对正确性
             require(
                 _isCorrectTokenPair(_localToken, _remoteToken),
                 "StandardBridge: wrong remote token for Optimism Mintable ERC20 local token"
             );
 
+            // 在本链销毁代币（在对侧链最终确认时会铸造）
             IOptimismMintableERC20(_localToken).burn(_from, _amount);
         } else {
+            // 情况 2：本地链原生代币
+            // 从用户转账到桥接合约（锁定代币）
             IERC20(_localToken).safeTransferFrom(_from, address(this), _amount);
+            
+            // 更新存款映射，记录锁定的代币数量
             deposits[_localToken][_remoteToken] = deposits[_localToken][_remoteToken] + _amount;
         }
 
-        // Emit the correct events. By default this will be ERC20BridgeInitiated, but child
-        // contracts may override this function in order to emit legacy events as well.
+        // 发出桥接发起事件
+        // 子合约可以重写此函数以发出传统事件
         _emitERC20BridgeInitiated(_localToken, _remoteToken, _from, _to, _amount, _extraData);
 
+        // 通过 CrossDomainMessenger 发送消息到对侧链
+        // 注意：代币地址顺序被反转
+        // 因为消息在对侧链执行，对侧链的 localToken 是本链的 remoteToken，反之亦然
         messenger.sendMessage({
-            _target: address(otherBridge),
+            _target: address(otherBridge),  // 对侧链的桥接合约
             _message: abi.encodeWithSelector(
                 this.finalizeBridgeERC20.selector,
-                // Because this call will be executed on the remote chain, we reverse the order of
-                // the remote and local token addresses relative to their order in the
-                // finalizeBridgeERC20 function.
-                _remoteToken,
-                _localToken,
+                // 地址顺序反转：因为在对侧链执行，对侧链的 localToken 是本链的 remoteToken
+                _remoteToken,  // 在对侧链这是 localToken
+                _localToken,   // 在对侧链这是 remoteToken
                 _from,
                 _to,
                 _amount,
@@ -384,25 +509,38 @@ abstract contract StandardBridge is Initializable {
         });
     }
 
-    /// @notice Checks if a given address is an OptimismMintableERC20. Not perfect, but good enough.
-    ///         Just the way we like it.
-    /// @param _token Address of the token to check.
-    /// @return True if the token is an OptimismMintableERC20.
+    /// @notice 检查给定地址是否是 OptimismMintableERC20
+    /// 
+    /// 使用 ERC165 接口检查来识别代币类型。
+    /// 支持两种类型：
+    /// - ILegacyMintableERC20：传统可铸造 ERC20（向后兼容）
+    /// - IOptimismMintableERC20：Optimism 可铸造 ERC20
+    /// 
+    /// @param _token 要检查的代币地址
+    /// @return 如果代币是 OptimismMintableERC20 返回 true
     function _isOptimismMintableERC20(address _token) internal view returns (bool) {
         return ERC165Checker.supportsInterface(_token, type(ILegacyMintableERC20).interfaceId)
             || ERC165Checker.supportsInterface(_token, type(IOptimismMintableERC20).interfaceId);
     }
 
-    /// @notice Checks if the "other token" is the correct pair token for the OptimismMintableERC20.
-    ///         Calls can be saved in the future by combining this logic with
-    ///         `_isOptimismMintableERC20`.
-    /// @param _mintableToken OptimismMintableERC20 to check against.
-    /// @param _otherToken    Pair token to check.
-    /// @return True if the other token is the correct pair token for the OptimismMintableERC20.
+    /// @notice 检查"另一个代币"是否是 OptimismMintableERC20 的正确配对代币
+    /// 
+    /// OptimismMintableERC20 代币有对应的配对代币：
+    /// - LegacyMintableERC20：使用 l1Token() 获取配对代币
+    /// - OptimismMintableERC20：使用 remoteToken() 获取配对代币
+    /// 
+    /// 这个检查确保桥接时使用正确的代币对，防止错误配对。
+    /// 
+    /// @param _mintableToken 要检查的 OptimismMintableERC20 代币
+    /// @param _otherToken     要检查的配对代币
+    /// @return 如果配对代币正确返回 true
     function _isCorrectTokenPair(address _mintableToken, address _otherToken) internal view returns (bool) {
+        // 检查是否是传统可铸造 ERC20
         if (ERC165Checker.supportsInterface(_mintableToken, type(ILegacyMintableERC20).interfaceId)) {
+            // 传统代币使用 l1Token() 获取配对代币
             return _otherToken == ILegacyMintableERC20(_mintableToken).l1Token();
         } else {
+            // Optimism 可铸造 ERC20 使用 remoteToken() 获取配对代币
             return _otherToken == IOptimismMintableERC20(_mintableToken).remoteToken();
         }
     }

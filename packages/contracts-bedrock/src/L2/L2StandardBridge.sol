@@ -15,12 +15,24 @@ import { OptimismMintableERC20 } from "src/universal/OptimismMintableERC20.sol";
 /// @custom:proxied true
 /// @custom:predeploy 0x4200000000000000000000000000000000000010
 /// @title L2StandardBridge
-/// @notice The L2StandardBridge is responsible for transfering ETH and ERC20 tokens between L1 and
-///         L2. In the case that an ERC20 token is native to L2, it will be escrowed within this
-///         contract. If the ERC20 token is native to L1, it will be burnt.
-///         NOTE: this contract is not intended to support all variations of ERC20 tokens. Examples
-///         of some token types that may not be properly supported by this contract include, but are
-///         not limited to: tokens with transfer fees, rebasing tokens, and tokens with blocklists.
+/// @notice L2StandardBridge 是 L2 侧的标准桥接合约，负责在 L1 和 L2 之间转移 ETH 和 ERC20 代币。
+/// 
+/// 核心功能：
+/// 1. **提款（Withdrawal）**：从 L2 向 L1 桥接资产
+///    - ETH：通过 CrossDomainMessenger 发送到 L1
+///    - ERC20：L2 原生代币锁定在合约中，L1 原生代币在 L2 销毁
+/// 
+/// 2. **存款最终确认（Deposit Finalization）**：确认从 L1 到 L2 的存款
+///    - 由 L1StandardBridge 通过跨链消息触发
+///    - 验证消息来源后，铸造代币或转移代币
+/// 
+/// 代币处理：
+/// - **L2 原生代币**：在 L2 锁定（escrow），在 L1 转移
+/// - **L1 原生代币（OptimismMintableERC20）**：在 L2 销毁，在 L1 转移
+/// 
+/// 重要限制：
+/// - 不支持所有类型的 ERC20 代币
+/// - 不支持：有转账费用的代币、rebase 代币、有黑名单的代币等
 contract L2StandardBridge is StandardBridge, ISemver {
     /// @custom:legacy
     /// @notice Emitted whenever a withdrawal from L2 to L1 is initiated.
@@ -84,14 +96,18 @@ contract L2StandardBridge is StandardBridge, ISemver {
     }
 
     /// @custom:legacy
-    /// @notice Initiates a withdrawal from L2 to L1.
-    ///         This function only works with OptimismMintableERC20 tokens or ether. Use the
-    ///         `bridgeERC20` function to bridge native L2 tokens to L1.
-    ///         Subject to be deprecated in the future.
-    /// @param _l2Token     Address of the L2 token to withdraw.
-    /// @param _amount      Amount of the L2 token to withdraw.
-    /// @param _minGasLimit Minimum gas limit to use for the transaction.
-    /// @param _extraData   Extra data attached to the withdrawal.
+    /// @notice 发起从 L2 到 L1 的提款
+    /// 
+    /// 这是传统的提款函数，用于向后兼容。
+    /// 只适用于 OptimismMintableERC20 代币或 ETH。
+    /// 对于原生 L2 代币，请使用 `bridgeERC20` 函数。
+    /// 
+    /// 注意：此函数可能在将来被弃用。
+    /// 
+    /// @param _l2Token    要提款的 L2 代币地址
+    /// @param _amount     要提款的 L2 代币数量
+    /// @param _minGasLimit 交易使用的最小 gas 限制
+    /// @param _extraData   附加到提款的额外数据
     function withdraw(
         address _l2Token,
         uint256 _amount,
@@ -107,19 +123,23 @@ contract L2StandardBridge is StandardBridge, ISemver {
     }
 
     /// @custom:legacy
-    /// @notice Initiates a withdrawal from L2 to L1 to a target account on L1.
-    ///         Note that if ETH is sent to a contract on L1 and the call fails, then that ETH will
-    ///         be locked in the L1StandardBridge. ETH may be recoverable if the call can be
-    ///         successfully replayed by increasing the amount of gas supplied to the call. If the
-    ///         call will fail for any amount of gas, then the ETH will be locked permanently.
-    ///         This function only works with OptimismMintableERC20 tokens or ether. Use the
-    ///         `bridgeERC20To` function to bridge native L2 tokens to L1.
-    ///         Subject to be deprecated in the future.
-    /// @param _l2Token     Address of the L2 token to withdraw.
-    /// @param _to          Recipient account on L1.
-    /// @param _amount      Amount of the L2 token to withdraw.
-    /// @param _minGasLimit Minimum gas limit to use for the transaction.
-    /// @param _extraData   Extra data attached to the withdrawal.
+    /// @notice 发起从 L2 到 L1 的提款，发送到 L1 上的目标账户
+    /// 
+    /// 重要警告：
+    /// - 如果 ETH 发送到 L1 上的智能合约且调用失败，ETH 将被锁定在 L1StandardBridge 中
+    /// - 如果可以通过增加 gas 成功重放调用，ETH 可能可以恢复
+    /// - 如果调用在任何数量的 gas 下都会失败，ETH 将永久锁定
+    /// 
+    /// 只适用于 OptimismMintableERC20 代币或 ETH。
+    /// 对于原生 L2 代币，请使用 `bridgeERC20To` 函数。
+    /// 
+    /// 注意：此函数可能在将来被弃用。
+    /// 
+    /// @param _l2Token    要提款的 L2 代币地址
+    /// @param _to         L1 上的接收者账户
+    /// @param _amount     要提款的 L2 代币数量
+    /// @param _minGasLimit 交易使用的最小 gas 限制
+    /// @param _extraData   附加到提款的额外数据
     function withdrawTo(
         address _l2Token,
         address _to,
@@ -142,13 +162,20 @@ contract L2StandardBridge is StandardBridge, ISemver {
     }
 
     /// @custom:legacy
-    /// @notice Internal function to initiate a withdrawal from L2 to L1 to a target account on L1.
-    /// @param _l2Token     Address of the L2 token to withdraw.
-    /// @param _from        Address of the withdrawer.
-    /// @param _to          Recipient account on L1.
-    /// @param _amount      Amount of the L2 token to withdraw.
-    /// @param _minGasLimit Minimum gas limit to use for the transaction.
-    /// @param _extraData   Extra data attached to the withdrawal.
+    /// @notice 内部函数：发起从 L2 到 L1 的提款，发送到 L1 上的目标账户
+    /// 
+    /// 这个函数根据代币类型选择不同的处理方式：
+    /// 1. **ETH**：调用 `_initiateBridgeETH` 处理 ETH 提款
+    /// 2. **ERC20 代币**：获取对应的 L1 代币地址，调用 `_initiateBridgeERC20` 处理
+    /// 
+    /// 对于 OptimismMintableERC20 代币，会通过 `l1Token()` 获取对应的 L1 代币地址。
+    /// 
+    /// @param _l2Token    要提款的 L2 代币地址
+    /// @param _from       提款者地址
+    /// @param _to         L1 上的接收者账户
+    /// @param _amount     要提款的 L2 代币数量
+    /// @param _minGasLimit 交易使用的最小 gas 限制
+    /// @param _extraData   附加到提款的额外数据
     function _initiateWithdrawal(
         address _l2Token,
         address _from,
@@ -159,9 +186,13 @@ contract L2StandardBridge is StandardBridge, ISemver {
     )
         internal
     {
+        // 判断是 ETH 还是 ERC20 代币
         if (_l2Token == Predeploys.LEGACY_ERC20_ETH) {
+            // ETH 提款：直接调用 ETH 桥接函数
             _initiateBridgeETH(_from, _to, _amount, _minGasLimit, _extraData);
         } else {
+            // ERC20 代币提款：获取对应的 L1 代币地址
+            // 对于 OptimismMintableERC20，l1Token() 返回对应的 L1 代币地址
             address l1Token = OptimismMintableERC20(_l2Token).l1Token();
             _initiateBridgeERC20(_l2Token, l1Token, _from, _to, _amount, _minGasLimit, _extraData);
         }

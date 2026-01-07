@@ -17,14 +17,28 @@ import { ISuperchainConfig } from "interfaces/L1/ISuperchainConfig.sol";
 
 /// @custom:proxied true
 /// @title L1StandardBridge
-/// @notice The L1StandardBridge is responsible for transfering ETH and ERC20 tokens between L1 and
-///         L2. In the case that an ERC20 token is native to L1, it will be escrowed within this
-///         contract. If the ERC20 token is native to L2, it will be burnt. Before Bedrock, ETH was
-///         stored within this contract. After Bedrock, ETH is instead stored inside the
-///         OptimismPortal contract.
-///         NOTE: this contract is not intended to support all variations of ERC20 tokens. Examples
-///         of some token types that may not be properly supported by this contract include, but are
-///         not limited to: tokens with transfer fees, rebasing tokens, and tokens with blocklists.
+/// @notice L1StandardBridge 是 L1 侧的标准桥接合约，负责在 L1 和 L2 之间转移 ETH 和 ERC20 代币。
+/// 
+/// 核心功能：
+/// 1. **存款（Deposit）**：从 L1 向 L2 桥接资产
+///    - ETH：通过 OptimismPortal 发送到 L2
+///    - ERC20：L1 原生代币锁定在合约中，L2 原生代币在 L1 销毁
+/// 
+/// 2. **提款最终确认（Withdrawal Finalization）**：确认从 L2 到 L1 的提款
+///    - 由 L2StandardBridge 通过跨链消息触发
+///    - 验证消息来源后，释放锁定的代币或铸造代币
+/// 
+/// 代币处理：
+/// - **L1 原生代币**：在 L1 锁定（escrow），在 L2 铸造
+/// - **L2 原生代币（OptimismMintableERC20）**：在 L1 销毁，在 L2 转移
+/// 
+/// ETH 处理：
+/// - Bedrock 之前：ETH 存储在 L1StandardBridge 中
+/// - Bedrock 之后：ETH 存储在 OptimismPortal 中
+/// 
+/// 重要限制：
+/// - 不支持所有类型的 ERC20 代币
+/// - 不支持：有转账费用的代币、rebase 代币、有黑名单的代币等
 contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, ReinitializableBase, ISemver {
     /// @custom:legacy
     /// @notice Emitted whenever a deposit of ETH from L1 into L2 is initiated.
@@ -130,45 +144,60 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
         return systemConfig.superchainConfig();
     }
 
-    /// @notice Allows EOAs to bridge ETH by sending directly to the bridge.
+    /// @notice 允许外部账户（EOA）通过直接向桥接合约发送 ETH 来桥接
+    /// 
+    /// 这是一个便利函数，用户可以直接向合约地址发送 ETH 来触发桥接。
+    /// 使用默认的 gas 限制（RECEIVE_DEFAULT_GAS_LIMIT）。
     receive() external payable override onlyEOA {
         _initiateETHDeposit(msg.sender, msg.sender, RECEIVE_DEFAULT_GAS_LIMIT, bytes(""));
     }
 
     /// @custom:legacy
-    /// @notice Deposits some amount of ETH into the sender's account on L2.
-    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
-    /// @param _extraData   Optional data to forward to L2.
-    ///                     Data supplied here will not be used to execute any code on L2 and is
-    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    /// @notice 将一定数量的 ETH 存入发送者在 L2 的账户
+    /// 
+    /// 这是传统的存款函数，用于向后兼容。
+    /// 
+    /// @param _minGasLimit L2 上存款消息的最小 gas 限制
+    /// @param _extraData   可选数据，转发到 L2
+    ///                    这些数据不会用于在 L2 上执行代码，仅作为额外数据发出，
+    ///                    方便链下工具使用
     function depositETH(uint32 _minGasLimit, bytes calldata _extraData) external payable onlyEOA {
         _initiateETHDeposit(msg.sender, msg.sender, _minGasLimit, _extraData);
     }
 
     /// @custom:legacy
-    /// @notice Deposits some amount of ETH into a target account on L2.
-    ///         Note that if ETH is sent to a contract on L2 and the call fails, then that ETH will
-    ///         be locked in the L2StandardBridge. ETH may be recoverable if the call can be
-    ///         successfully replayed by increasing the amount of gas supplied to the call. If the
-    ///         call will fail for any amount of gas, then the ETH will be locked permanently.
-    /// @param _to          Address of the recipient on L2.
-    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
-    /// @param _extraData   Optional data to forward to L2.
-    ///                     Data supplied here will not be used to execute any code on L2 and is
-    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    /// @notice 将一定数量的 ETH 存入 L2 上的目标账户
+    /// 
+    /// 重要警告：
+    /// - 如果 ETH 发送到 L2 上的智能合约且调用失败，ETH 将被锁定在 L2StandardBridge 中
+    /// - 如果可以通过增加 gas 成功重放调用，ETH 可能可以恢复
+    /// - 如果调用在任何数量的 gas 下都会失败，ETH 将永久锁定
+    /// 
+    /// @param _to          L2 上的接收者地址
+    /// @param _minGasLimit L2 上存款消息的最小 gas 限制
+    /// @param _extraData   可选数据，转发到 L2
+    ///                    这些数据不会用于在 L2 上执行代码，仅作为额外数据发出，
+    ///                    方便链下工具使用
     function depositETHTo(address _to, uint32 _minGasLimit, bytes calldata _extraData) external payable {
         _initiateETHDeposit(msg.sender, _to, _minGasLimit, _extraData);
     }
 
     /// @custom:legacy
-    /// @notice Deposits some amount of ERC20 tokens into the sender's account on L2.
-    /// @param _l1Token     Address of the L1 token being deposited.
-    /// @param _l2Token     Address of the corresponding token on L2.
-    /// @param _amount      Amount of the ERC20 to deposit.
-    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
-    /// @param _extraData   Optional data to forward to L2.
-    ///                     Data supplied here will not be used to execute any code on L2 and is
-    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    /// @notice 将一定数量的 ERC20 代币存入发送者在 L2 的账户
+    /// 
+    /// 这是传统的 ERC20 存款函数，用于向后兼容。
+    /// 
+    /// 代币处理：
+    /// - L1 原生代币：锁定在 L1StandardBridge 中，在 L2 铸造
+    /// - L2 原生代币（OptimismMintableERC20）：在 L1 销毁，在 L2 转移
+    /// 
+    /// @param _l1Token    正在存入的 L1 代币地址
+    /// @param _l2Token    L2 上对应的代币地址
+    /// @param _amount     要存入的 ERC20 数量
+    /// @param _minGasLimit L2 上存款消息的最小 gas 限制
+    /// @param _extraData   可选数据，转发到 L2
+    ///                    这些数据不会用于在 L2 上执行代码，仅作为额外数据发出，
+    ///                    方便链下工具使用
     function depositERC20(
         address _l1Token,
         address _l2Token,
@@ -184,15 +213,20 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
     }
 
     /// @custom:legacy
-    /// @notice Deposits some amount of ERC20 tokens into a target account on L2.
-    /// @param _l1Token     Address of the L1 token being deposited.
-    /// @param _l2Token     Address of the corresponding token on L2.
-    /// @param _to          Address of the recipient on L2.
-    /// @param _amount      Amount of the ERC20 to deposit.
-    /// @param _minGasLimit Minimum gas limit for the deposit message on L2.
-    /// @param _extraData   Optional data to forward to L2.
-    ///                     Data supplied here will not be used to execute any code on L2 and is
-    ///                     only emitted as extra data for the convenience of off-chain tooling.
+    /// @notice 将一定数量的 ERC20 代币存入 L2 上的目标账户
+    /// 
+    /// 代币处理：
+    /// - L1 原生代币：锁定在 L1StandardBridge 中，在 L2 铸造
+    /// - L2 原生代币（OptimismMintableERC20）：在 L1 销毁，在 L2 转移
+    /// 
+    /// @param _l1Token    正在存入的 L1 代币地址
+    /// @param _l2Token    L2 上对应的代币地址
+    /// @param _to         L2 上的接收者地址
+    /// @param _amount     要存入的 ERC20 数量
+    /// @param _minGasLimit L2 上存款消息的最小 gas 限制
+    /// @param _extraData   可选数据，转发到 L2
+    ///                    这些数据不会用于在 L2 上执行代码，仅作为额外数据发出，
+    ///                    方便链下工具使用
     function depositERC20To(
         address _l1Token,
         address _l2Token,
@@ -208,11 +242,15 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
     }
 
     /// @custom:legacy
-    /// @notice Finalizes a withdrawal of ETH from L2.
-    /// @param _from      Address of the withdrawer on L2.
-    /// @param _to        Address of the recipient on L1.
-    /// @param _amount    Amount of ETH to withdraw.
-    /// @param _extraData Optional data forwarded from L2.
+    /// @notice 最终确认从 L2 到 L1 的 ETH 提款
+    /// 
+    /// 这是提款流程的最后一步。由 L2StandardBridge 通过跨链消息调用。
+    /// 在 OptimismPortal 中证明提款后，最终在这里确认并释放 ETH。
+    /// 
+    /// @param _from      L2 上的提款者地址
+    /// @param _to        L1 上的接收者地址
+    /// @param _amount    要提款的 ETH 数量
+    /// @param _extraData 从 L2 转发的可选数据
     function finalizeETHWithdrawal(
         address _from,
         address _to,
@@ -222,17 +260,25 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
         external
         payable
     {
+        // 调用基类的 finalizeBridgeETH，它会验证消息来源并执行转账
         finalizeBridgeETH(_from, _to, _amount, _extraData);
     }
 
     /// @custom:legacy
-    /// @notice Finalizes a withdrawal of ERC20 tokens from L2.
-    /// @param _l1Token   Address of the token on L1.
-    /// @param _l2Token   Address of the corresponding token on L2.
-    /// @param _from      Address of the withdrawer on L2.
-    /// @param _to        Address of the recipient on L1.
-    /// @param _amount    Amount of the ERC20 to withdraw.
-    /// @param _extraData Optional data forwarded from L2.
+    /// @notice 最终确认从 L2 到 L1 的 ERC20 代币提款
+    /// 
+    /// 这是提款流程的最后一步。由 L2StandardBridge 通过跨链消息调用。
+    /// 
+    /// 代币处理：
+    /// - L1 原生代币：从 deposits 映射中扣除并转账给接收者
+    /// - L2 原生代币（OptimismMintableERC20）：在 L1 铸造给接收者
+    /// 
+    /// @param _l1Token   L1 上的代币地址
+    /// @param _l2Token   L2 上对应的代币地址
+    /// @param _from      L2 上的提款者地址
+    /// @param _to        L1 上的接收者地址
+    /// @param _amount    要提款的 ERC20 数量
+    /// @param _extraData 从 L2 转发的可选数据
     function finalizeERC20Withdrawal(
         address _l1Token,
         address _l2Token,
@@ -243,6 +289,7 @@ contract L1StandardBridge is StandardBridge, ProxyAdminOwnedBase, Reinitializabl
     )
         external
     {
+        // 调用基类的 finalizeBridgeERC20，它会验证消息来源并处理代币
         finalizeBridgeERC20(_l1Token, _l2Token, _from, _to, _amount, _extraData);
     }
 
